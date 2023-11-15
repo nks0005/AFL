@@ -803,6 +803,7 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
 static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
+  // q 할당 
   struct queue_entry* q = ck_alloc(sizeof(struct queue_entry));
 
   q->fname        = fname;
@@ -930,8 +931,11 @@ static inline u8 has_new_bits(u8* virgin_map) {
        that have not been already cleared from the virgin map - since this will
        almost always be the case. */
 
+    // current가 0이 아니고 -> run이 됬다
+    // current & virgin이 0이 아니다 -> 변동이 됬다?
     if (unlikely(*current) && unlikely(*current & *virgin)) {
 
+      // ret 이 0이나 1
       if (likely(ret < 2)) {
 
         u8* cur = (u8*)current;
@@ -950,14 +954,16 @@ static inline u8 has_new_bits(u8* virgin_map) {
 
 #else
 
-        if ((cur[0] && vir[0] == 0xff) || (cur[1] && vir[1] == 0xff) ||
-            (cur[2] && vir[2] == 0xff) || (cur[3] && vir[3] == 0xff)) ret = 2;
-        else ret = 1;
+          // 32비트씩 계산 -> 
+          if ((cur[0] && vir[0] == 0xff) || (cur[1] && vir[1] == 0xff) ||
+              (cur[2] && vir[2] == 0xff) || (cur[3] && vir[3] == 0xff)) ret = 2;
+          else ret = 1;
 
 #endif /* ^WORD_SIZE_64 */
 
       }
 
+      
       *virgin &= ~*current;
 
     }
@@ -2302,13 +2308,14 @@ static u8 run_target(char** argv, u32 timeout) {
      must prevent any earlier operations from venturing into that
      territory. */
 
+  // 코드 커버리지 정보 0으로 초기화
   memset(trace_bits, 0, MAP_SIZE);
   MEM_BARRIER();
 
   /* If we're running in "dumb" mode, we can't rely on the fork server
      logic compiled into the target program, so we will just keep calling
      execve(). There is a bit of code duplication between here and 
-     init_forkserver(), but c'est la vie. */
+     init_forkserver(), but c 'est la vie. */
 
   if (dumb_mode == 1 || no_forkserver) {
 
@@ -2601,6 +2608,8 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   if (dumb_mode != 1 && !no_forkserver && !forksrv_pid)
     init_forkserver(argv);
 
+
+  // 
   if (q->exec_cksum) {
 
     memcpy(first_trace, trace_bits, MAP_SIZE);
@@ -2611,6 +2620,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
   start_us = get_cur_time_us();
 
+  // stage_max = 3 or 8
   for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
 
     u32 cksum;
@@ -3160,6 +3170,12 @@ static void write_crash_readme(void) {
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
 
+/*
+  fault
+    2 > FAULT_CRASH 
+    0 > FAULT_NONE
+
+*/
 static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
   u8  *fn = "";
@@ -4686,6 +4702,7 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   /* This handles FAULT_ERROR for us: */
 
+  // fault -> 2 or 0 
   queued_discovered += save_if_interesting(argv, out_buf, len, fault);
 
   if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
@@ -7988,6 +8005,7 @@ int main(int argc, char** argv) {
 
   if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
 
+  // 신호 처리 초기화
   setup_signal_handlers();
   check_asan_opts();
 
@@ -8031,19 +8049,26 @@ int main(int argc, char** argv) {
 
   check_if_tty();
 
+  // get /proc/stat -> cpu 코어 카운트 추출
   get_core_count();
 
 #ifdef HAVE_AFFINITY
   bind_to_free_cpu();
 #endif /* HAVE_AFFINITY */
 
+  // process /proc/sys/kernel/core_pattern
   check_crash_handling();
   check_cpu_governor();
 
+  // Load postprocesser?
+  // 퍼징이 끝난 후에 실행되는 사용자 지정 후처리 작업
   setup_post();
+
+  // 공유 메모리 생성 
   setup_shm();
   init_count_class16();
 
+  // 폴더 생성
   setup_dirs_fds();
   read_testcases();
   load_auto();
@@ -8054,12 +8079,14 @@ int main(int argc, char** argv) {
 
   if (!timeout_given) find_timeout();
 
+  // @@ 찾기
   detect_file_args(argv + optind + 1);
 
   if (!out_file) setup_stdio_file();
 
   check_binary(argv[optind]);
 
+  // 시작 시간
   start_time = get_cur_time();
 
   if (qemu_mode)
@@ -8067,8 +8094,10 @@ int main(int argc, char** argv) {
   else
     use_argv = argv + optind;
 
+  // 프로그램 동작 테스트
   perform_dry_run(use_argv);
 
+  // process top queue
   cull_queue();
 
   show_init_stats();
