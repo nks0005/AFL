@@ -1446,6 +1446,7 @@ static void read_testcases(void) {
 
   /* Auto-detect non-in-place resumption attempts. */
 
+  // queue가 없으면..
   fn = alloc_printf("%s/queue", in_dir);
   if (!access(fn, F_OK)) in_dir = fn; else ck_free(fn);
 
@@ -1454,9 +1455,10 @@ static void read_testcases(void) {
   /* We use scandir() + alphasort() rather than readdir() because otherwise,
      the ordering  of test cases would vary somewhat randomly and would be
      difficult to control. */
-
+  // nl에 저장
   nl_cnt = scandir(in_dir, &nl, NULL, alphasort);
 
+  // init 데이터가 필요함
   if (nl_cnt < 0) {
 
     if (errno == ENOENT || errno == ENOTDIR)
@@ -3001,6 +3003,8 @@ static void pivot_inputs(void) {
 
     if (!rsl) rsl = q->fname; else rsl++;
 
+    // rsl -> 파일명 -> queue의 파일명 -> 'seed-0'
+
     /* If the original file name conforms to the syntax and the recorded
        ID matches the one we'd assign, just use the original file name.
        This is valuable for resuming fuzzing runs. */
@@ -3011,6 +3015,7 @@ static void pivot_inputs(void) {
 #  define CASE_PREFIX "id_"
 #endif /* ^!SIMPLE_FILES */
 
+    // -> 'id=000000' 인 경우
     if (!strncmp(rsl, CASE_PREFIX, 3) &&
         sscanf(rsl + 3, "%06u", &orig_id) == 1 && orig_id == id) {
 
@@ -3036,16 +3041,19 @@ static void pivot_inputs(void) {
       }
 
     } else {
-
+      // 그외
       /* No dice - invent a new name, capturing the original one as a
          substring. */
 
 #ifndef SIMPLE_FILES
 
       u8* use_name = strstr(rsl, ",orig:");
+        // ',orig:'가 있는지 여부 확인
 
       if (use_name) use_name += 6; else use_name = rsl;
       nfn = alloc_printf("%s/queue/id:%06u,orig:%s", out_dir, id, use_name);
+      
+      // 초기 -> out_dir/queue/id:000000,orig:seed_0
 
 #else
 

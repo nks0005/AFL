@@ -234,49 +234,148 @@ main()
             timeout_given = 1 or 2
             
 
-    setup_signal_handlers();
-
-    check_asan_opts()
-
-    [if]fix_up_sync()
+    setup_signal_handlers():
+        handle_stop_sig
+            SIGHUP, SIGINT, SIGTERM
         
-    save_cmdline()
+        handle_timeout
+            SIGALRM
+        
+        handle_resize
+            SIGWINCH
 
-    fix_up_bannder()
+        handle_skipreq;
+            SIGUSR1
+        
+        SIG_IGN ( ignore )
+            SIGTSTP
+            SIGPIPE
 
-    check_if_tty()
+    check_asan_opts():
+        getenv ("ASAN_OPTIONS")
+        getenv ("MSAN_OPTIONS")
 
-    get_core_count()
+    [if]fix_up_sync():
+        파일명에서 알파벳, -, _가 아니면 에러
+        32바이트보다 길면 에러
+        out_dir + sync_id = *x
+        out_dir = *x
 
-    check_crash_handling()
+        
+    save_cmdline(argc, argv):
+        buf, orig_cmdline 에 현재 명령 줄을 담음
 
-    check_cpu_governor()
 
-    setup_post()
+    fix_up_bannder(argv[optind]):
 
-    setup_shm()
+    check_if_tty():
+        터미널 확인 -> 사이즈 확인
+        
+    get_core_count():
+        get /proc/stat
+        cpu 코어 카운트 추출
 
-    init_count_class16()
+    check_crash_handling():
+        process /proc/sys/kernel/core_pattern
 
-    setup_dirs_fds()
+    check_cpu_governor():
+        cpu 스케쥴러 관리 ?
 
-    read_testcases()
+    setup_post():
+        퍼징 끝난 후 실행되는 사용자 지정 후처리 작업
 
-    load_auto()
+    setup_shm():
+        공유 메모리 
+        virgin_bits, virgin_tmout, virgin_crash -> 0xff 0xff...
 
-    pivot_inputs()
+        shm_id = shmget(IPC_PRIVATE...)
 
-    [if]load_extras()
+        atexit(remove_shm)
 
-    detect_file_args()
+        "__AFL_SHM_ID" 에 shm_id 값을 넣음 (%d)
 
-    setup_stdio_file()
+        trace_bits = shmat(shm_id)
+        
 
-    check_binary()
+    init_count_class16():
 
-    get_cur_time()
+    setup_dirs_fds():
+        다양한 폴더 생성 
 
-    perform_dry_run()
+    read_testcases():
+        in_dir -> -i 매개변수 -> '-i ./WICHR/work/initial_seeds'
+
+        nl 변수에 저장
+        예시 
+            html_response_page=back.asp&html_response_return_page=st_ipv6.asp&html_response_message=
+
+        u8* fn = alloc_printf("%s/%s", in_dir, nl[i]->d_name);
+
+        add_to_queue(fn, st.st_size, 0 or 1[x]):
+            fname -> 경로 + 파일명 (seed-0)
+
+            첫 seed가 queue + queue_top
+
+            queued_paths++
+            pending_not_fuzzed++
+
+
+
+    load_auto():
+        -M + .state + auto_extras / auto_0...
+    
+
+    pivot_inputs():
+        q = queue 
+        
+        while(q){
+
+            *rsl = 'seed-0'의 [0]
+
+            최종적으로 초기 값으로 
+            queue 폴더에 
+
+            id:000000,orig:seed_0 이라는 파일을 만듬
+            link_or_copy(q->fname, nfn);
+            // 
+        }
+
+
+    [if]load_extras():
+        dict.txt 파일을 불러옴 -x ''
+        
+        파일 이기에..
+        load_extras_file():
+            extras
+            extras_cnt
+
+        qsort(extras, )
+
+        -> -x 로 받은 파일을 읽어서 extras에 채운다
+
+
+    detect_file_args():
+        @@?
+
+    setup_stdio_file():
+        out_dir/.cur_input 파일 만들고 
+        out_fd = 
+
+    check_binary():
+        바이너리 체크? "PATH"?
+
+    get_cur_time():
+
+    use_argv = argv + optind;
+        use_argv => -i -f 이거 다 제외한거..
+        '/afl/afl-fuzz -i ./WICHR/work/initial_seeds -o ./WICHR/work -m 8G -M fuzzer-master -x ./WICHR/work/dict.txt -t 5000+ -- /usr/local/bin/php-cgi '''
+        ->/usr/local/bin/php-cgi, ''
+
+
+    
+    perform_dry_run():  
+        
+        
 
     cull_queue()
 
@@ -291,7 +390,17 @@ main()
     while(1){
         cull_queue()
 
-        show_stats()
+        fuzz_one() -> mutate
 
-        sync_fuzzers()
+        [if]sync_fuzzers()
+
+        stop_soon -> CTRL + C
+
+
+        query_cur = query_cur->next;
+        current_entry++;
     }
+
+    
+
+
