@@ -201,3 +201,97 @@ write_to_testcase
 run_target
 
 q에 채운다  ---->...
+
+
+
+
+
+# 코드 흐름 파악
+
+main()
+    get args
+    `/afl/afl-fuzz -i ./WICHR/work/initial_seeds -o ./WICHR/work -m 8G -M fuzzer-master -x ./WICHR/work/dict.txt -t 5000+ -- /usr/local/bin/php-cgi ''`
+
+        -i : input dir
+            in_dir
+        
+        -o : output dir
+            out_dir
+        
+        -m : memory limit
+            mem_limit
+            mem_limit_given = 1
+
+        -M : master sync ID
+            sync_id 
+            c
+            force_deterministic = 1
+        
+        -x : dictionary
+            extras_dir 
+        
+        -t : timeout
+            timeout_given = 1 or 2
+            
+
+    setup_signal_handlers();
+
+    check_asan_opts()
+
+    [if]fix_up_sync()
+        
+    save_cmdline()
+
+    fix_up_bannder()
+
+    check_if_tty()
+
+    get_core_count()
+
+    check_crash_handling()
+
+    check_cpu_governor()
+
+    setup_post()
+
+    setup_shm()
+
+    init_count_class16()
+
+    setup_dirs_fds()
+
+    read_testcases()
+
+    load_auto()
+
+    pivot_inputs()
+
+    [if]load_extras()
+
+    detect_file_args()
+
+    setup_stdio_file()
+
+    check_binary()
+
+    get_cur_time()
+
+    perform_dry_run()
+
+    cull_queue()
+
+    show_init_stats()
+
+    find_start_position()
+
+    write_stats_file()
+
+    save_auto()
+
+    while(1){
+        cull_queue()
+
+        show_stats()
+
+        sync_fuzzers()
+    }

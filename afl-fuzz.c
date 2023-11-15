@@ -8070,6 +8070,7 @@ int main(int argc, char** argv) {
 
   // 폴더 생성
   setup_dirs_fds();
+  // 큐 생성?
   read_testcases();
   load_auto();
 
@@ -8162,10 +8163,8 @@ int main(int argc, char** argv) {
     skipped_fuzz = fuzz_one(use_argv);
 
     if (!stop_soon && sync_id && !skipped_fuzz) {
-      
       if (!(sync_interval_cnt++ % SYNC_INTERVAL))
         sync_fuzzers(use_argv);
-
     }
 
     if (!stop_soon && exit_1) stop_soon = 2;
