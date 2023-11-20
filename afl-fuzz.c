@@ -1341,6 +1341,7 @@ static void cull_queue(void) {
     q = q->next;
   }
 
+  // --
   /* Let's see if anything in the bitmap isn't captured in temp_v.
      If yes, and if it has a top_rated[] contender, let's use it. */
 
@@ -5083,12 +5084,14 @@ static u8 fuzz_one(char** argv) {
 
   /* Map the test case into memory. */
 
+  // fname -> queue 파일
   fd = open(queue_cur->fname, O_RDONLY);
 
   if (fd < 0) PFATAL("Unable to open '%s'", queue_cur->fname);
 
   len = queue_cur->len;
 
+  // 현재 파일 데이터를 메모리에 로드 + in_bug_ orig_in 변수에 저장
   orig_in = in_buf = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
 
   if (orig_in == MAP_FAILED) PFATAL("Unable to mmap '%s'", queue_cur->fname);
@@ -5098,12 +5101,17 @@ static u8 fuzz_one(char** argv) {
   /* We could mmap() out_buf as MAP_PRIVATE, but we end up clobbering every
      single byte anyway, so it wouldn't give us any performance or memory usage
      benefits. */
+  // MAP_PRIVATE로 메모리 매핑을 하면 해당 메모리 영역은 수정이 가능하지만, 원본 파일에 대한 변경은 반영되지 않습니다. 
 
   out_buf = ck_alloc_nozero(len);
 
+
+  // in_buf, orig_in // out_buf
+
+
   subseq_tmouts = 0;
 
-  cur_depth = queue_cur->depth;
+   / = queue_cur->depth;
 
   /*******************************************
    * CALIBRATION (only if failed earlier on) *
@@ -8132,6 +8140,7 @@ int main(int argc, char** argv) {
 
     cull_queue();
 
+    // ---------------------------------------------------------
     if (!queue_cur) {
 
       queue_cycle++;
@@ -8139,6 +8148,7 @@ int main(int argc, char** argv) {
       cur_skipped_paths = 0;
       queue_cur         = queue;
 
+      // 초기에는 0일듯
       while (seek_to) {
         current_entry++;
         seek_to--;
@@ -8155,6 +8165,8 @@ int main(int argc, char** argv) {
       /* If we had a full queue cycle with no new finds, try
          recombination strategies next. */
 
+      // 초기에는 prev_queued = 0 
+      // queued_paths -> add_queue할때 증가함
       if (queued_paths == prev_queued) {
 
         if (use_splicing) cycles_wo_finds++; else use_splicing = 1;
@@ -8167,6 +8179,7 @@ int main(int argc, char** argv) {
         sync_fuzzers(use_argv);
 
     }
+    // ---------------------------------------------------------
 
     skipped_fuzz = fuzz_one(use_argv);
 

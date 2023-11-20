@@ -343,7 +343,7 @@ main()
 
     [if]load_extras():
         dict.txt 파일을 불러옴 -x ''
-        
+
         파일 이기에..
         load_extras_file():
             extras
@@ -358,8 +358,8 @@ main()
         @@?
 
     setup_stdio_file():
-        out_dir/.cur_input 파일 만들고 
-        out_fd = 
+        out_dir/.cur_input 파일 만들고
+        out_fd =
 
     check_binary():
         바이너리 체크? "PATH"?
@@ -372,20 +372,48 @@ main()
         ->/usr/local/bin/php-cgi, ''
 
 
-    
-    perform_dry_run():  
-        
-        
 
-    cull_queue()
+    perform_dry_run():
+        calibrate_case():
+            init_forkserver():
+                fork()
+                -> 파이프로 입력 / 출력 전달
 
-    show_init_stats()
+            for( 3 ~ 8 )
+                write_to_testcase():
+                    -> out_fd에 연동 + out_file. 
+                run_target
+                    1. 코드커버리지 0
+                    2. 실행
+                    3. 크래쉬 확인 + return
+            has_new_bits
+            var_bytes[i] 업데이트 -> 이전 tracebit랑 현재 tracebit 비교해서 없으면 var_bytes[i] = 1 
+                새로운 trace bit 추적용으로 생각됨 -> curl_queue에서 사용하는듯
 
-    find_start_position()
+            update_bitmap_score():
+                trace_bits[i]가 있다면..
+                    top_rated?
+                    score_changed = 1 -> cull_queue에서 사용함
 
-    write_stats_file()
 
-    save_auto()
+
+    cull_queue():
+        queued_favored  = 0;
+        pending_favored = 0;
+
+        top_rated[i]->favored = 1;
+
+        mark_as_redundant():
+
+
+
+    show_init_stats():
+
+    find_start_position():
+
+    write_stats_file(0, 0, 0):
+
+    save_auto():
 
     while(1){
         cull_queue()
@@ -404,3 +432,195 @@ main()
     
 
 
+### cull_queue()
+
+### fuzz_one()
+returns 0 if fuzzed successfully, 1 if skipped or bailed out.
+
+```c
+struct queue_entry {
+
+  u8* fname;                          /* File name for the test case      */
+  u32 len;                            /* Input length                     */
+
+  u8  cal_failed,                     /* Calibration failed?              */
+      trim_done,                      /* Trimmed?                         */
+      was_fuzzed,                     /* Had any fuzzing done yet?        */
+      passed_det,                     /* Deterministic stages passed?     */
+      has_new_cov,                    /* Triggers new coverage?           */
+      var_behavior,                   /* Variable behavior?               */
+      favored,                        /* Currently favored?               */
+      fs_redundant;                   /* Marked as redundant in the fs?   */
+
+  u32 bitmap_size,                    /* Number of bits set in bitmap     */
+      exec_cksum;                     /* Checksum of the execution trace  */
+
+  u64 exec_us,                        /* Execution time (us)              */
+      handicap,                       /* Number of queue cycles behind    */
+      depth;                          /* Path depth                       */
+
+  u8* trace_mini;                     /* Trace bytes, if kept             */
+  u32 tc_ref;                         /* Trace bytes ref count            */
+
+  struct queue_entry *next,           /* Next element, if any             */
+                     *next_100;       /* 100 elements ahead               */
+
+};
+```
+
+
+
+```c
+setup_signal_handlers();
+/*
+    SIGHUP, SIGINT, SIGTERM, SIGALRM, SIGWINCH, SIGUSR1, SIGTSTP, SIGPIPE의 Signal Handler 정의
+*/
+
+check_asan_opts();
+/*
+    getenv("ASAN_OPTIONS"), getenv("MSAN_OPTIONS");
+    ASAN, MSAN 옵션 확인
+*/
+
+if (sync_id) fix_up_sync();
+/*
+    -M 으로 받은 폴더에 out_dir 변수 맞추기
+*/
+
+if (getenv("AFL_PRELOAD")) {
+  setenv("LD_PRELOAD", getenv("AFL_PRELOAD"), 1);
+  setenv("DYLD_INSERT_LIBRARIES", getenv("AFL_PRELOAD"), 1);
+}
+/*
+    AFL_PRELOAD -> LD_PRELOAD
+*/
+
+save_cmdline(argc, argv);
+/*
+    buf = orig_cmdline 에 argv들을 저장함
+*/
+
+fix_up_banner(argv[optind]);
+
+check_if_tty();
+/*
+    터미널에서 실행되고 있는지를 확인하는것같음.
+*/
+
+
+// get /proc/stat -> cpu 코어 카운트 추출
+get_core_count();
+/*
+    FILE* f = fopen("/proc/stat", "r");
+    if (!strncmp(tmp, "cpu", 3) && isdigit(tmp[3])) cpu_core_count++;
+*/
+
+check_crash_handling();
+/*
+    s32 fd = open("/proc/sys/kernel/core_pattern", O_RDONLY);
+    
+*/
+check_cpu_governor();
+/*
+    스케일링 관련
+*/
+
+// Load postprocesser?
+// 퍼징이 끝난 후에 실행되는 사용자 지정 후처리 작업
+setup_post();
+/*
+    u8* fn = getenv("AFL_POST_LIBRARY");
+    dh = dlopen(fn, RTLD_NOW);
+    if (!dh) FATAL("%s", dlerror());
+    post_handler = dlsym(dh, "afl_postprocess");
+*/
+
+// 공유 메모리 생성 
+setup_shm();
+/*
+    shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+    setenv(SHM_ENV_VAR, shm_str, 1); // __AFL_SHM_ID
+    trace_bits = shmat(shm_id, NULL, 0);
+*/
+init_count_class16();
+
+// 폴더 생성
+setup_dirs_fds();
+/*
+    -M 폴더 + /queue, /queue/.state, ... 폴더 세팅
+*/
+
+// 큐 생성
+read_testcases();
+/*
+    fn = alloc_printf("%s/queue", in_dir);
+    if (!access(fn, F_OK)) in_dir = fn; else ck_free(fn);
+
+    기존 queue들에 대한 정보 획득
+*/
+load_auto();
+/*
+    u8* fn = alloc_printf("%s/.state/auto_extras/auto_%06u", in_dir, i);
+
+    auto_extras 들을 불러옴
+ */
+
+pivot_inputs();
+/*
+    초기에는 seed 로 부터 queue에 파일로 넣어둠
+    out_dir/queue/id:000000,orig:seed_0
+*/
+
+if (extras_dir) load_extras(extras_dir);
+/*
+
+*/
+
+if (!timeout_given) find_timeout();
+/*
+
+*/
+
+// @@ 찾기
+detect_file_args(argv + optind + 1);
+/*
+
+*/
+
+if (!out_file) setup_stdio_file();
+/*
+    .cur_input -> out_fd
+*/
+
+check_binary(argv[optind]);
+/*
+    대상 바이너리 확인
+*/
+
+start_time = get_cur_time();
+
+use_argv = argv + optind;
+
+// 프로그램 동작 테스트
+perform_dry_run(use_argv);
+/*
+    fd = open(q->fname, O_RDONLY);
+    read(fd, use_mem, q->len) != q->len
+
+    res = calibrate_case(argv, q, use_mem, 0, 1);
+
+    -> 처음 seed queue에 대하여 프로그램 실행 
+
+    뮤테이트를 하지 않음.
+*/
+
+// process top queue
+cull_queue();
+
+show_init_stats();
+
+seek_to = find_start_position();
+
+write_stats_file(0, 0, 0);
+save_auto();
+```
