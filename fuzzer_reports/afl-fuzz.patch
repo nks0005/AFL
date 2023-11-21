@@ -1,0 +1,1292 @@
+--- afl-fuzz_original.c	2023-09-14 16:05:24.894161100 +0900
++++ afl-fuzz.c	2023-09-14 16:05:24.894161100 +0900
+@@ -23,6 +23,9 @@
+ #define AFL_MAIN
+ #define MESSAGES_TO_STDOUT
+ 
++#define TRUE 1
++#define FALSE 0
++#define HTTP_VAR_TYPES 3
+ #define _GNU_SOURCE
+ #define _FILE_OFFSET_BITS 64
+ 
+@@ -45,6 +48,7 @@
+ #include <termios.h>
+ #include <dlfcn.h>
+ #include <sched.h>
++#include <regex.h>
+ 
+ #include <sys/wait.h>
+ #include <sys/time.h>
+@@ -56,6 +60,7 @@
+ #include <sys/ioctl.h>
+ #include <sys/file.h>
+ 
++#include <stdbool.h>
+ #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
+ #  include <sys/sysctl.h>
+ #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
+@@ -122,7 +127,8 @@
+            run_over10m,               /* Run time over 10 minutes?        */
+            persistent_mode,           /* Running in persistent mode?      */
+            deferred_mode,             /* Deferred forkserver mode?        */
+-           fast_cal;                  /* Try to calibrate faster?         */
++           fast_cal,                  /* Try to calibrate faster?         */
++           skip_http_dict = 1;        /* use http dictionary mutator      */
+ 
+ static s32 out_fd,                    /* Persistent fd for out_file       */
+            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
+@@ -148,6 +154,8 @@
+                    clear_screen = 1,  /* Window resized?                  */
+                    child_timed_out;   /* Traced process timed out?        */
+ 
++u32 qskip =0;
++
+ EXP_ST u32 queued_paths,              /* Total number of queued testcases */
+            queued_variable,           /* Testcases with variable behavior */
+            queued_at_start,           /* Total number of initial inputs   */
+@@ -182,7 +190,9 @@
+            bytes_trim_in,             /* Bytes coming into the trimmer    */
+            bytes_trim_out,            /* Bytes coming outa the trimmer    */
+            blocks_eff_total,          /* Blocks subject to effector maps  */
+-           blocks_eff_select;         /* Blocks selected as fuzzable      */
++           blocks_eff_select,         /* Blocks selected as fuzzable      */
++           http_execs;                /* Executions used by HTTP stages   */
++
+ 
+ static u32 subseq_tmouts;             /* Number of timeouts in a row      */
+ 
+@@ -256,6 +266,7 @@
+                           *queue_cur, /* Current offset within the queue  */
+                           *queue_top, /* Top of the list                  */
+                           *q_prev100; /* Previous 100 marker              */
++static struct queue_entry *stopped_running_queue_at = NULL;
+ 
+ static struct queue_entry*
+   top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
+@@ -273,6 +284,21 @@
+ static u32 a_extras_cnt;              /* Total number of tokens available */
+ 
+ static u8* (*post_handler)(u8* buf, u32* len);
++static u32 entry_cnt=0;
++struct var_entry {
++
++    u8* varname;                          /* File name for the test case      */
++    u32 len;                            /* Input length                     */
++    struct var_entry *next;           /* Next element, if any             */
++
++};
++static struct var_entry *vars_ll[3];
++
++enum {
++    /* 00 */ COOKIES,
++    /* 01 */ GETS,
++    /* 02 */ POSTS
++};
+ /* Interesting values, as per config.h */
+ 
+ static s8  interesting_8[]  = { INTERESTING_8 };
+@@ -298,7 +324,9 @@
+   /* 13 */ STAGE_EXTRAS_UI,
+   /* 14 */ STAGE_EXTRAS_AO,
+   /* 15 */ STAGE_HAVOC,
+-  /* 16 */ STAGE_SPLICE
++  /* 16 */ STAGE_SPLICE,
++  STAGE_EXTRAS_HQC,
++  STAGE_EXTRAS_HT
+ };
+ 
+ /* Stage value types */
+@@ -370,6 +398,41 @@
+ }
+ 
+ 
++static inline void add_var_to_ll(char* str, u8 which){
++
++  struct var_entry * v = ck_alloc(sizeof(struct var_entry));
++
++  if (strchr(str,'=') == NULL){
++    // if no =, then a value to the parameter b/c it makes more sense.
++    u32 vallen = UR(5);
++    vallen += 1;
++
++    long origstrlen = strlen(str);
++    v->len          = origstrlen+vallen;
++    v->varname = (u8*) malloc(v->len+2);
++    memset(v->varname, 0, v->len+2);
++    memcpy(v->varname, str, origstrlen);
++    v->varname[origstrlen] = '=';
++    for (int i =origstrlen+1;i < v->len;i++){
++      v->varname[i] = UR(95) + 0x20;
++    }
++    v->varname[v->len] = '\x00';
++  } else {
++    v->varname      = strdup(str);
++    v->len          = strlen(v->varname);
++  }
++
++  if (vars_ll[which]){
++    v->next = vars_ll[which];
++    vars_ll[which]= v;
++  } else {
++    vars_ll[which] = v;
++    v->next = NULL;
++  }
++  entry_cnt++;
++}
++
++
+ /* Shuffle an array of pointers. Might be slightly biased. */
+ 
+ static void shuffle_ptrs(void** ptrs, u32 cnt) {
+@@ -404,6 +467,12 @@
+ 
+   if (cpu_core_count < 2) return;
+ 
++  if (getenv("AFL_SET_AFFINITY")) {
++    i = atoi(getenv("AFL_SET_AFFINITY"));
++     WARNF("Setting binding to %u", i);
++    goto bind_to_core;
++  }
++
+   if (getenv("AFL_NO_AFFINITY")) {
+ 
+     WARNF("Not binding to a CPU core (AFL_NO_AFFINITY set).");
+@@ -483,14 +552,16 @@
+          "Uh-oh, looks like all %u CPU cores on your system are allocated to\n"
+          "    other instances of afl-fuzz (or similar CPU-locked tasks). Starting\n"
+          "    another fuzzer on this machine is probably a bad plan, but if you are\n"
+-         "    absolutely sure, you can set AFL_NO_AFFINITY and try again.\n",
++         "    absolutely sure, you can set AFL_NO_AFFINITY and try again.\n", 
+          cpu_core_count);
+ 
+     FATAL("No more free CPU cores");
+ 
+   }
+-
++  
+   OKF("Found a free CPU core, binding to #%u.", i);
++    
++  bind_to_core:
+ 
+   cpu_aff = i;
+ 
+@@ -1194,10 +1265,35 @@
+ 
+ #endif /* ^__x86_64__ */
+ 
++struct test_process_info {
++    int initialized;
++    int afl_id;
++    int port;
++    int reqr_process_id;
++    int process_id;
++    char error_type[20]; /* SQL, Command */
++    char error_msg[100];
++    bool capture;
++};
+ /* Get rid of shared memory (atexit handler). */
+ 
+ static void remove_shm(void) {
+ 
++  if (getenv("AFL_META_INFO_ID")){
++        // clean up last shared memory area
++        int mem_key = atoi(getenv("AFL_META_INFO_ID"));
++        int witch_shm_id = shmget(mem_key , sizeof(struct test_process_info), 0666);
++
++        if (witch_shm_id  >= 0 ) {
++            struct test_process_info *afl_info = (struct test_process_info *) shmat(witch_shm_id, NULL, 0);  /* attach */
++            afl_info->afl_id = 0;
++            afl_info->capture = false;
++            fprintf(stderr, "\033[36m [Witcher] init completed afl_shm_id=%d : afl_ifo %d %d %d %d !!!\033[0m\n",
++                    shm_id, mem_key, witch_shm_id, afl_info->afl_id, afl_info->capture);
++        }
++        fprintf(stderr, "\n");
++  }
++
+   shmctl(shm_id, IPC_RMID, NULL);
+ 
+ }
+@@ -1346,13 +1442,23 @@
+   memset(virgin_tmout, 255, MAP_SIZE);
+   memset(virgin_crash, 255, MAP_SIZE);
+ 
++
++  char *port = getenv("TARGET_PORT");
+   shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
++  if (port){
++  	  printf("target port: %s \n", port);
++      int port_id = atoi(port);
++      shm_id = shmget(port_id , MAP_SIZE, IPC_CREAT | 0666);
++  } else {
++      shm_id = shmget(shm_id, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0666);
++  }
+ 
+   if (shm_id < 0) PFATAL("shmget() failed");
+ 
+   atexit(remove_shm);
+ 
+   shm_str = alloc_printf("%d", shm_id);
++  ACTF("Using SHMID of '%s'...", shm_str );
+ 
+   /* If somebody is asking us to fuzz instrumented binaries in dumb mode,
+      we don't want them to detect instrumentation, since we won't be sending
+@@ -1360,11 +1466,14 @@
+      later on, perhaps? */
+ 
+   if (!dumb_mode) setenv(SHM_ENV_VAR, shm_str, 1);
++  setenv(SHM_ENV_VAR, shm_str, 1);
+ 
+   ck_free(shm_str);
+ 
+   trace_bits = shmat(shm_id, NULL, 0);
+-  
++  trace_bits[0] = 6;
++  printf("shm_id=%d , tb[0]=%d  %p\n", shm_id, trace_bits[0], trace_bits);
++
+   if (!trace_bits) PFATAL("shmat() failed");
+ 
+ }
+@@ -1982,10 +2091,14 @@
+ 
+   if (pipe(st_pipe) || pipe(ctl_pipe)) PFATAL("pipe() failed");
+ 
++  printf("here b4 %d\n", getpid());
++
+   forksrv_pid = fork();
+ 
+-  if (forksrv_pid < 0) PFATAL("fork() failed");
++  printf("here after %d %d \n", getpid(), forksrv_pid);
+ 
++  if (forksrv_pid < 0) PFATAL("fork() failed");
++  
+   if (!forksrv_pid) {
+ 
+     struct rlimit r;
+@@ -2030,9 +2143,35 @@
+     /* Isolate the process and configure standard descriptors. If out_file is
+        specified, stdin is /dev/null; otherwise, out_fd is cloned instead. */
+ 
+-    setsid();
+-    dup2(dev_null_fd, 1);
+-    dup2(dev_null_fd, 2);
++   setsid();
++   printf("connecting up to stdout,\n");
++   // [WC] write to logfile
++
++   u8 *outfilename, *errfilename;
++
++   if (sync_id) {
++       outfilename = alloc_printf("%s.out", out_dir);
++       errfilename = alloc_printf("%s.err", out_dir);
++   } else {
++       outfilename = alloc_printf("%s/afl.out", out_dir);
++       errfilename = alloc_printf("%s/afl.err", out_dir);
++   }
++
++   FILE *aflout  = fopen(outfilename,"a+");
++
++   dup2(fileno(aflout), 1);
++    //dup2(dev_null_fd, 1);
++    outfilename = alloc_printf("%s/%s.err", out_dir, sync_id );
++    FILE *aflerr  = fopen(errfilename,"a+");
++
++    dup2(fileno(aflerr), 2);
++
++    ck_free(outfilename);
++    ck_free(errfilename);
++
++      //dup2(dev_null_fd, 2);
++    
++    
+ 
+     if (out_file) {
+ 
+@@ -2081,6 +2220,19 @@
+                            "allocator_may_return_null=1:"
+                            "msan_track_origins=0", 0);
+ 
++    printf("[[[[AFL]]]]] we are getting to execv %s\n", target_path);
++    int index=0;    
++    printf("\tARGS\n");
++    char *s = *argv;
++    index =0;
++    for (; s; index++) {
++	printf("\t\t%s\n", s);
++	s = *(argv+index);
++    }
++    printf("\tSCRIPT_FILENAME=%s\n",getenv("SCRIPT_FILENAME"));
++    printf("\tAFL_PRELOAD=%s\n",getenv("AFL_PRELOAD"));
++    printf("\tLD_LIBRARY_PATH=%s\n", getenv("LD_LIBRARY_PATH"));
++    printf("\n");
+     execv(target_path, argv);
+ 
+     /* Use a distinctive bitmap signature to tell the parent about execv()
+@@ -2092,13 +2244,13 @@
+   }
+ 
+   /* Close the unneeded endpoints. */
+-
++ 
+   close(ctl_pipe[0]);
+   close(st_pipe[1]);
+ 
+   fsrv_ctl_fd = ctl_pipe[1];
+   fsrv_st_fd  = st_pipe[0];
+-
++  
+   /* Wait for the fork server to come up, but don't wait too long. */
+ 
+   it.it_value.tv_sec = ((exec_tmout * FORK_WAIT_MULT) / 1000);
+@@ -2116,17 +2268,20 @@
+   /* If we have a four-byte "hello" message from the server, we're all set.
+      Otherwise, try to figure out what went wrong. */
+ 
++  printf("fs status=%ls %d ",&status, rlen);
++
+   if (rlen == 4) {
++    printf("[AFL] Forkserver up\n");
+     OKF("All right - fork server is up.");
+     return;
+   }
+ 
+   if (child_timed_out)
+     FATAL("Timeout while initializing fork server (adjusting -t may help)");
+-
++  
+   if (waitpid(forksrv_pid, &status, 0) <= 0)
+     PFATAL("waitpid() failed");
+-
++  
+   if (WIFSIGNALED(status)) {
+ 
+     if (mem_limit && mem_limit < 500 && uses_asan) {
+@@ -2311,7 +2466,6 @@
+ 
+       setsid();
+ 
+-      dup2(dev_null_fd, 1);
+       dup2(dev_null_fd, 2);
+ 
+       if (out_file) {
+@@ -2396,12 +2550,12 @@
+     s32 res;
+ 
+     if ((res = read(fsrv_st_fd, &status, 4)) != 4) {
+-
++      	
+       if (stop_soon) return 0;
+       RPFATAL(res, "Unable to communicate with fork server (OOM?)");
+ 
+     }
+-
++    
+   }
+ 
+   if (!WIFSTOPPED(status)) child_pid = 0;
+@@ -2434,6 +2588,7 @@
+   if (WIFSIGNALED(status) && !stop_soon) {
+ 
+     kill_signal = WTERMSIG(status);
++    printf("\tchild_timeout=%d kill_signal=%d, status=%d\n", child_timed_out, kill_signal, status);
+     if (child_timed_out && kill_signal == SIGKILL) return FAULT_TMOUT;
+ 
+     return FAULT_CRASH;
+@@ -2576,6 +2731,7 @@
+     if (stop_soon || fault != crash_mode) goto abort_calibration;
+ 
+     if (!dumb_mode && !stage_cur && !count_bytes(trace_bits)) {
++      printf("count_bytes  = %d, spot=%d\n, %hhn", count_bytes(trace_bits), trace_bits[0], trace_bits);
+       fault = FAULT_NOINST;
+       goto abort_calibration;
+     }
+@@ -2704,6 +2860,7 @@
+     u8* fn = strrchr(q->fname, '/') + 1;
+ 
+     ACTF("Attempting dry run with '%s'...", fn);
++    fflush(stdout);
+     fd = open(q->fname, O_RDONLY);
+     if (fd < 0) PFATAL("Unable to open '%s'", q->fname);
+ 
+@@ -2719,9 +2876,12 @@
+ 
+     if (stop_soon) return;
+ 
+-    if (res == crash_mode || res == FAULT_NOBITS)
+-      SAYF(cGRA "    len = %u, map size = %u, exec speed = %llu us\n" cRST, 
++    if (res == crash_mode || res == FAULT_NOBITS) {
++      SAYF(cGRA "    len = %u, map size = %u, exec speed = %llu us\n" cRST,
+            q->len, q->bitmap_size, q->exec_us);
++      fflush(stdout);
++    }
++
+ 
+     switch (res) {
+ 
+@@ -3259,7 +3419,7 @@
+                         unique_crashes, kill_signal, describe_op(0));
+ 
+ #else
+-
++      
+       fn = alloc_printf("%s/crashes/id_%06llu_%02u", out_dir, unique_crashes,
+                         kill_signal);
+ 
+@@ -3399,6 +3559,7 @@
+ 
+   fprintf(f, "start_time        : %llu\n"
+              "last_update       : %llu\n"
++             "stage_name        : %s\n"
+              "fuzzer_pid        : %u\n"
+              "cycles_done       : %llu\n"
+              "execs_done        : %llu\n"
+@@ -3424,8 +3585,13 @@
+              "afl_banner        : %s\n"
+              "afl_version       : " VERSION "\n"
+              "target_mode       : %s%s%s%s%s%s%s\n"
+-             "command_line      : %s\n",
+-             start_time / 1000, get_cur_time() / 1000, getpid(),
++             "command_line      : %s\n"
++             "execs_http        : %llu\n"
++             "paths_havoc       : %llu\n"
++             "paths_split       : %llu\n"
++             "paths_http_qc     : %llu\n"
++             "paths_http_dict   : %llu\n",
++             start_time / 1000, get_cur_time() / 1000, stage_name, getpid(),
+              queue_cycle ? (queue_cycle - 1) : 0, total_execs, eps,
+              queued_paths, queued_favored, queued_discovered, queued_imported,
+              max_depth, current_entry, pending_favored, pending_not_fuzzed,
+@@ -3438,7 +3604,13 @@
+              persistent_mode ? "persistent " : "", deferred_mode ? "deferred " : "",
+              (qemu_mode || dumb_mode || no_forkserver || crash_mode ||
+               persistent_mode || deferred_mode) ? "" : "default",
+-             orig_cmdline);
++             orig_cmdline,
++             http_execs,
++             stage_finds[STAGE_HAVOC],
++             stage_finds[STAGE_SPLICE],
++             stage_finds[STAGE_EXTRAS_HQC],
++             stage_finds[STAGE_EXTRAS_HT]
++             );
+              /* ignore errors */
+ 
+   fclose(f);
+@@ -4225,7 +4397,8 @@
+        cRST "%-10s " bSTG bV "\n", tmp, DI(queued_discovered));
+ 
+   if (!skip_deterministic)
+-    sprintf(tmp, "%s/%s, %s/%s, %s/%s",
++    sprintf(tmp, "%s/%s, %s/%s, %s/%s, %s/%s",
++            DI(stage_finds[STAGE_EXTRAS_HT]), DI(stage_cycles[STAGE_EXTRAS_HT]),
+             DI(stage_finds[STAGE_EXTRAS_UO]), DI(stage_cycles[STAGE_EXTRAS_UO]),
+             DI(stage_finds[STAGE_EXTRAS_UI]), DI(stage_cycles[STAGE_EXTRAS_UI]),
+             DI(stage_finds[STAGE_EXTRAS_AO]), DI(stage_cycles[STAGE_EXTRAS_AO]));
+@@ -4434,6 +4607,7 @@
+     hang_tmout = MIN(EXEC_TIMEOUT, exec_tmout * 2 + 100);
+ 
+   OKF("All set and ready to roll!");
++  fflush(stdout);
+ 
+ }
+ 
+@@ -4459,7 +4633,9 @@
+   static u8 tmp[64];
+   static u8 clean_trace[MAP_SIZE];
+ 
+-  u8  needs_write = 0, fault = 0;
++  //struct var_entry *current_http_var;
++
++  u8  needs_write = 0, fault = 0;//, do_http_remove=(!skip_http_stage);
+   u32 trim_exec = 0;
+   u32 remove_len;
+   u32 len_p2;
+@@ -4592,6 +4768,9 @@
+   write_to_testcase(out_buf, len);
+ 
+   fault = run_target(argv, exec_tmout);
++  if (fault == FAULT_CRASH){
++      printf("HERE's CRASHY!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
++  } 
+ 
+   if (stop_soon) return 1;
+ 
+@@ -4616,7 +4795,7 @@
+   }
+ 
+   /* This handles FAULT_ERROR for us: */
+-
++  
+   queued_discovered += save_if_interesting(argv, out_buf, len, fault);
+ 
+   if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
+@@ -4926,6 +5105,209 @@
+ 
+ }
+ 
++// This builds the outbufvars from the out_buf (out_buf is current AFL starting point)
++static u32 build_base_bufs(u8* outbufvars[], u8* out_buf, int len){
++  int zerocnt = 0;
++  int outbuf_allocs=0;
++  int last = 0;
++
++  // loop through out_buf chars, add out_buf variables for each type to outbufvars
++  for (int i =0; i < len;i++){
++    if (out_buf[i] == '\x00' && zerocnt < 3){
++      int seg_len = strlen(out_buf+last);
++      if (last + seg_len > len){
++        seg_len = len-last;
++      }
++      if (seg_len>0){
++        outbufvars[zerocnt] = ck_alloc(seg_len+1);
++        outbuf_allocs++;
++        memset(outbufvars[zerocnt], 0, seg_len+1);
++        memcpy(outbufvars[zerocnt], out_buf+last, seg_len);
++        outbufvars[zerocnt][seg_len] = '\x00';
++      } else {
++        outbufvars[zerocnt] = NULL;
++      }
++      last = i+1;
++      zerocnt++;
++    }
++  } //end for i
++
++  if ((last == 0 && len>0) || (last>0 && last < len)){
++    int seg_len = strlen(out_buf+last);
++    if (last + seg_len > len){
++      seg_len = len-last;
++    }
++    if (seg_len > 0 && zerocnt < 3){
++      outbufvars[zerocnt] = ck_alloc(seg_len+1);
++      outbuf_allocs++;
++      memcpy(outbufvars[zerocnt], out_buf+last, seg_len);
++      outbufvars[zerocnt][seg_len] = '\x00';
++//          fprintf(aflout, "[WC-AFL] Copying %d chars '%s' from cliffhanger \n", seg_len, out_buf+last);
++//          fflush(aflout);
++      zerocnt++;
++    }
++
++  }
++  for (;zerocnt < 3;zerocnt++){
++    outbufvars[zerocnt] = NULL;
++  }
++  return outbuf_allocs;
++}
++
++static void print_buf(FILE* aflout, u8* tweaked, int cur_len, u32 var_strlen[], char* header){
++  fprintf(aflout,"[WC-AFL] %s (%d) %d %d %d => \e[36m", header, cur_len, var_strlen[COOKIES], var_strlen[GETS], var_strlen[POSTS]);
++  int vstrcnt=0;
++  int var_type_cnt = 0;
++
++  for (int j=0; j < cur_len;j++){
++    if (vstrcnt == var_strlen[var_type_cnt]){
++      fprintf(aflout, "\e[0m");
++    }
++    if (tweaked[j] >= 0x20 && tweaked[j] < 0x7f){
++      fprintf(aflout,"%c",tweaked[j]);
++    } else {
++      if (tweaked[j] == 0x0){
++        fprintf(aflout,"\e[0m || ");
++      } else {
++        fprintf(aflout,"\\x%02x",tweaked[j]);
++      }
++
++    }
++    vstrcnt++;
++    if (tweaked[j] == 0x00){
++      fprintf(aflout, "\e[36m");
++      vstrcnt=0;
++      var_type_cnt++;
++    }
++
++  }
++  fprintf(aflout,"\e[0m<EOT>\n");
++  fflush (aflout);
++}
++static void free_var_array(u8* var_str[], int count){
++  for (int i =0; i < count; i++){
++    if (var_str[i]){
++      ck_free(var_str[i]);
++    }
++  }
++}
++
++static void simp_pbuf(u32 length, u8* buf, FILE* aflout){
++
++  for (int j=0; j < length;j++){
++
++    if (buf[j]>= 0x20 && buf[j] < 0x7f){
++      fprintf(aflout,"%c",buf[j]);
++    } else {
++      if (buf[j] == 0x0){
++        fprintf(aflout," XxX ");
++      } else {
++        fprintf(aflout,"\\x%02x",buf[j]);
++      }
++
++    }
++  }
++  fflush (aflout);
++}
++
++static u32 build_buf_from_var(u8* var_str[], u32 var_strlen[], u8* outbufvars[], u8* tweaked){
++  u32 cur_len =0;
++  u8 *token = NULL;
++  u8 *start = NULL;
++  FILE *tmpout  = fopen("/tmp/aflout-tmp.log","a+");  // DEBUG TO REMOVE
++  
++  // loop through all 3 types 
++  for (int j=0; j < 3;j++){
++    token = NULL;
++    // if we have some of this type, then copy to tweaked 
++    // var_str is a single name/value pair
++    if (var_str[j] != NULL){
++      int tlen = var_strlen[j];
++      memcpy(tweaked+cur_len, var_str[j], tlen);
++      cur_len += tlen;
++
++      start = strdup(var_str[j]);
++      token = start;
++      token = strtok(token, "=");
++    }
++    
++    // if the outbuf has variables of this type and it matches the variable name used by var_str then remove the one from the outbuffvars 
++    // so the new one is used by the page
++    if (outbufvars[j]){
++      int tlen = strlen(outbufvars[j]);
++      u8 *currentob = strdup(outbufvars[j]);
++      if (token && strlen(token) > 1) {
++        u32 reti = 0;
++        regex_t regex;
++        regmatch_t regmatch[3];
++        char regexpstr[strlen(token+1)+10];
++        if (j == COOKIES){
++          sprintf(regexpstr, "[\\^;]%s[^;]*", token+1);
++        } else {
++          sprintf(regexpstr, "[\\^&]%s[^&]*", token+1);
++        }
++        reti = regcomp(&regex, regexpstr, 0);
++        if (reti) {
++          fprintf(tmpout, "[WC-AFL] Could not compile regex token='%s'\n", token+1);
++          fflush(tmpout);
++
++        } else {
++            reti = regexec(&regex, currentob, 3, regmatch, 0);
++          if (!reti) {
++            // token should always start with separator
++            fprintf(tmpout, "\tvar_str(%d)=%s, token=%s, token+1=%s ", var_strlen[j], var_str[j], token, token+1);
++            fprintf(tmpout, " strlen(currentob)=%ld MATCH = %d %d  '%s' ",strlen(currentob),  regmatch[0].rm_so, regmatch[0].rm_eo, regexpstr);
++            fflush(tmpout);
++            int remaining_str_len = strlen(currentob + regmatch[0].rm_eo);
++            memcpy(currentob+regmatch[0].rm_so, currentob + regmatch[0].rm_eo, remaining_str_len);
++            int nullterm_pos = tlen-(regmatch[0].rm_eo-regmatch[0].rm_so);
++            if (nullterm_pos < strlen(currentob)){
++                currentob[nullterm_pos] = '\x00';
++            }
++
++            tlen = strlen(outbufvars[j]);   // set tlen to new length without deleted variable
++          }
++        }
++
++      }
++      // add sep if necessary between inserted and original
++      if (var_strlen[j] > 0 && tlen > 0 ){
++        if (j == COOKIES){
++          if (currentob[0] != ';'){
++            tweaked[cur_len] = ';';
++            cur_len++;
++          }
++        } else{
++          if (currentob[0] != '&'){
++            tweaked[cur_len] = '&';
++            cur_len++;
++          }
++        }
++      }
++      memcpy(tweaked + cur_len,currentob, tlen);
++
++      cur_len += strlen(currentob);
++
++      fprintf(tmpout, "BEFORE free currentob of %p .....",currentob );
++      fflush(tmpout);
++
++      free(currentob);
++      fprintf(tmpout, "  AFTER free currentob\n");
++      fflush(tmpout);
++    }
++
++    tweaked[cur_len] = '\x00';
++    cur_len++;
++    if (var_str[j] != NULL && start) {
++      fprintf(tmpout, " Freeing Start \n");
++      free(start);
++    }
++    
++  } // end for j 
++  fflush(tmpout);
++  fclose(tmpout);
++  return cur_len;
++}
+ 
+ /* Take the current entry from the queue, fuzz it for a while. This
+    function is a tad too long... returns 0 if fuzzed successfully, 1 if
+@@ -4938,6 +5320,14 @@
+   u64 havoc_queued,  orig_hit_cnt, new_hit_cnt;
+   u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1;
+ 
++  // http req dictionary values
++  u8 *pick_buf, *add_on;
++  s32 x=0, t= 0, exptr = 0, add_on_len = 1, random_loc;
++  u32 random_items, pick_len;
++  s32 zeroPntCnt=0, last_optr=0, cur_pick_len = 0, last_zero_ptr=0;
++  s32 optr, added_dist;
++  FILE *aflout_extras = NULL;
++  
+   u8  ret_val = 1, doing_det = 0;
+ 
+   u8  a_collect[MAX_AUTO_EXTRA];
+@@ -5070,15 +5460,30 @@
+   /* Skip right away if -d is given, if we have done deterministic fuzzing on
+      this entry ourselves (was_fuzzed), or if it has gone through deterministic
+      testing in earlier, resumed runs (passed_det). */
+-
+-  if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det)
+-    goto havoc_stage;
++    
++  if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det) {
++    if (sync_id){
++      // if using phuzzer naming then will always pick fuzzer-1 to do http_dict havoc
++      // this covers when queue is larger and fuzzer-master gets stuck in http queue combining and 
++      // also to prevent it from being for every core when dictionary size is larger.
++      if (strcmp(sync_id,"fuzzer-1") == 0){
++        goto http_dictionary_havoc_stage; // formerly havoc_stage, if using phuzzer naming then set fuzzer-1 to http dict, b/c only slighl
++      } else {
++        goto havoc_stage; // formerly havoc_stage
++      }
++      
++    } else {
++      goto http_queue_var_combine_stage;
++    }
++  }
++    
++//goto havoc_stage;
+ 
+   /* Skip deterministic fuzzing if exec path checksum puts this out of scope
+      for this master instance. */
+ 
+   if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1)
+-    goto havoc_stage;
++    goto http_dictionary_havoc_stage; // formerly havoc_stage
+ 
+   doing_det = 1;
+ 
+@@ -6037,6 +6442,484 @@
+ 
+   if (!queue_cur->passed_det) mark_as_det_done(queue_cur);
+ 
++  /* HTTP STAGE 1
++   * Start of HTTP Extras, 2 stages
++   * Queue Combine takes COOKIES/GETS/POSTS from each queue combines them into 3 linked lists
++   * It then adds them to the current out_buf and all queued inputs until all vars have been used at leasst once
++   */
++  
++  http_queue_var_combine_stage:
++  
++  new_hit_cnt = queued_paths + unique_crashes;
++
++  if (skip_http_dict) goto havoc_stage;
++  
++  aflout_extras  = fopen("/tmp/aflout-extras.log","a+");  // DEBUG TO REMOVE
++  fprintf(aflout_extras, "[WC-AFL] ******* Processing HTTP Stage 1 ******** \n");
++
++  stage_name  = "http queue comb";
++  stage_short = "ext_HQC";
++  stage_cur   = 0;
++  stage_max   = extras_cnt * len;
++
++  stage_val_type = STAGE_VAL_NONE;
++
++  orig_hit_cnt = queued_paths + unique_crashes;
++  u32 prior_round_hit_cnt = orig_hit_cnt;
++  struct queue_entry *queue_search;
++
++  queue_search = queue;
++
++  FILE *logfile2 = fopen("/tmp/afl_queue","a+");
++  fprintf(logfile2, "Starting http extras\n");
++
++  u8 buffer[MAX_FILE];
++  u8 vars[3][MAX_FILE];
++  u32 vars_len[] = {0,0,0};
++
++  int var_type_cnt = 0;
++  int adds_to_ll =0;
++  u64 length_added=0;
++  u64 queue_elem_cnt=0;
++  //build linked list of name value pairs by type, COOKIES, GETS, POSTS using all queued files
++  // output => vars_ll (linked list)
++  
++  while(queue_search != NULL){
++    for (int i=0; i < 3; i++){
++      vars[i][0] = '\x00';
++    }
++    fprintf(logfile2,"%s ",  queue_search->fname);
++
++    FILE* qfn = fopen(queue_search->fname,"rb");
++    if (qfn == NULL){
++      queue_search = queue_search->next;
++      continue;
++    }
++    int buf_size = fread(buffer,1, MAX_FILE,qfn);
++    fclose(qfn);
++    var_type_cnt = 0;
++    u32 var_str_pos =0;
++    for (int i =0; i< buf_size;i++){
++      if (buffer[i] == '\x00') {
++        vars_len[var_type_cnt]++;
++        var_type_cnt++;
++        var_str_pos = 0;
++      } else {
++        vars[var_type_cnt][var_str_pos] = buffer[i];
++        vars_len[var_type_cnt]++;
++        var_str_pos++;
++        vars[var_type_cnt][var_str_pos] = '\x00';
++      }
++      if (var_type_cnt == 3){  //don't care about values after POSTS section
++        fprintf(logfile2, "BREAKING OUT DOOODS!\n");
++        break;
++      }
++    }
++
++    for(int i=0; i < 3;i++){
++      u8* starting_str = strdup(vars[i]);
++      u8* token = starting_str;
++      token = strtok(token, "&");
++      u8 skip = 0;
++      fprintf(logfile2, "HERE\n");
++      fflush(logfile2);
++      while (token != NULL){
++        struct var_entry* cur_ve = vars_ll[i];
++        while (cur_ve != NULL){
++          if (strcmp(token, cur_ve->varname) == 0){
++            skip = 1;
++            break;
++          }
++          cur_ve = cur_ve->next;
++        }
++        cur_ve = NULL;
++
++        if (skip){
++          fprintf(logfile2, "\t SKIPPING %d = %s\n",i, token);
++
++        } else {
++
++          fprintf(logfile2, "\t Using %d = %s\n",i, token);
++          fflush(logfile2);
++          add_var_to_ll(token, i);
++          adds_to_ll++;
++          length_added += strlen(token);
++        }
++        skip = 0;
++        token = strtok(NULL,"&");
++      } // end while token
++
++      free(starting_str);
++    }
++    queue_search = queue_search->next;
++    queue_elem_cnt++;
++  } // end while queue_search of inputs
++  fprintf(logfile2,"[WC-AFL] Number of name-value pairs added to linked list = %d for %llu bytes queue eles= %llu\n", adds_to_ll, length_added, queue_elem_cnt);
++
++
++    u8 keepgoing =1;
++    struct var_entry *cur_var[3];
++    cur_var[COOKIES] = vars_ll[COOKIES];
++    cur_var[GETS] = vars_ll[GETS];
++    cur_var[POSTS] = vars_ll[POSTS];
++    u32 loopcnt=0;
++
++    // let's use any new inputs
++    if (qskip % 10 == 0) {
++      fprintf(aflout_extras, "[WC-AFL] Reseting queue ptr to run through entire queue\n");  // maybe better is randomly select a few queues.
++      stopped_running_queue_at = NULL;  // queue is the bottom of the queue
++    }
++    // loop through vars_ll until we've exhausted all 3 COOKIES, GETs, POSTS at least once
++    while (keepgoing != 7) {
++      loopcnt++;
++      u8 *var_str[3] = {NULL, NULL, NULL};
++      u32 var_strlen[3] = {0,0,0};
++      u8 keeper = 1;
++
++      // using vars_ll create 3 var_str to move forward with, set keepgoing if end of a ll is reached.
++      for (int i=0; i < 3; i++){
++        char sep = '&';
++        if (i==COOKIES){
++          sep = ';';
++        }
++
++        if (cur_var[i]){
++          var_strlen[i] = cur_var[i]->len + 1;                   // for prepended var separator
++          var_str[i] = ck_alloc(var_strlen[i]+1);          // for null terminating char
++          var_str[i][0] = sep;
++          memcpy(var_str[i]+1, cur_var[i]->varname, var_strlen[i]);
++          cur_var[i] = cur_var[i]->next;
++        } else {
++          //assert("never here");
++        }
++        if (!cur_var[i]){  // if cur var is null reset immeidately for next orbit in while loop
++           cur_var[i] = vars_ll[i];
++           keepgoing |= keeper;
++        }
++        keeper = keeper * 2;
++      } // end for i
++
++      // if all three have cycled at least once, then stop.
++      if (keepgoing == 7){
++        fprintf(aflout_extras, "[WC-AFL] END OF LOOP cnt=%d keepgoing=%d skipcnt=%d \n", loopcnt-1, keepgoing, qskip);
++        fflush(aflout_extras);
++        break;
++      }
++      
++      /**
++       * 
++       * This starts HTTP stage 1a (single var with outbuf)
++       * 
++       * 
++       */
++
++      u8* outbufvars[3];
++      build_base_bufs(outbufvars, out_buf, len);
++
++      u8* tweaked = ck_alloc(len+var_strlen[COOKIES]+var_strlen[GETS]+var_strlen[POSTS]+3+3); // 3 for potential extra null terms and 3 for additional & preceeding original
++      // Combination of everything into tweaked.
++      
++      // creates tweaked buffer from var_str selected earlier and the outbufvars 
++      int cur_len = build_buf_from_var(var_str, var_strlen, outbufvars, tweaked);
++
++      // run tweaked buffer without concatenating with other queue files.
++      // this tests the tweaked (with a new var added from queue)
++      int current_hit_cnt = queued_paths + unique_crashes;
++      if (common_fuzz_stuff(argv, tweaked, cur_len)) {
++        fprintf(aflout_extras, "Aborted and now freeing\n");
++        goto abandon_entry;
++      }
++      http_execs++;
++      if (current_hit_cnt != prior_round_hit_cnt){
++        print_buf(aflout_extras, tweaked, cur_len, var_strlen, "\e33m] OUT+VAR FOUND PATH\e[0m");
++        fflush(aflout_extras);
++        prior_round_hit_cnt=current_hit_cnt;
++      }
++
++      free_var_array(outbufvars, 3);
++      ck_free(tweaked);
++
++      /**
++       * 
++       * This ends HTTP stage 1a (single var with outbuf)
++       * 
++       */
++      
++      /**
++       * 
++       * This start  HTTP stage 1b (single var with each queue buf)
++       * 
++       */
++
++      u8 *qbuff = ck_alloc(MAX_FILE);
++      if (stopped_running_queue_at == NULL){
++        queue_search = queue;
++      } else {
++        queue_search = stopped_running_queue_at->next;
++      }
++
++      int qfilep =0;
++      u32 outbufvars_allocs = 0;
++      prior_round_hit_cnt = current_hit_cnt;
++      u32 inner_loopcnt=0;
++
++      // for each queue_file use the var_str to cross polinate variables between queues
++      while(queue_search != NULL) {
++
++        memset(qbuff,0,MAX_FILE);
++        //fprintf(aflout, "#%d %s\n", qfilep, queue_search->fname);
++        //fflush(aflout);
++        FILE *qfn = fopen(queue_search->fname, "rb");
++
++        int buf_size = fread(qbuff,1, MAX_FILE,qfn);
++        fclose(qfn);
++        
++        // builds outbufvars from queued file instead of out_buf
++        outbufvars_allocs = build_base_bufs(outbufvars, qbuff, buf_size);
++
++        int tweaked_len = buf_size+var_strlen[COOKIES]+var_strlen[GETS]+var_strlen[POSTS]+3+3;
++        tweaked = ck_alloc(tweaked_len); // 3 for potential extra null terms and 3 for additional & preceeding original
++        
++        // clean up tweaked incase left over junk from last pass.
++        memset(tweaked,0,tweaked_len);
++        
++        // build tweaked from var_str 
++        cur_len = build_buf_from_var(var_str, var_strlen, outbufvars, tweaked);
++
++        prior_round_hit_cnt=queued_paths + unique_crashes;        
++        if (common_fuzz_stuff(argv, tweaked, cur_len)) {
++          fprintf(aflout_extras, "Aborted and now freeing\n");
++          goto abandon_entry;
++        }
++        
++        current_hit_cnt = queued_paths + unique_crashes;
++
++        http_execs++;
++        if (current_hit_cnt != prior_round_hit_cnt){
++          fprintf(aflout_extras, "[WC-AFL] \e[32m ADDED new input to QUEUE \e[0m Outbuf allocs = %d queue_size= %lld, loop count = %d, inner loop cnt = %u \n", outbufvars_allocs, queue_elem_cnt, loopcnt, inner_loopcnt);
++          fflush(aflout_extras);
++          //print_buf(aflout_extras, tweaked, cur_len, var_strlen, "\e[33m QUEUE+VAR FOUND PATH \e[0m");
++        }
++        //print_buf(aflout, tweaked, cur_len, var_strlen, "VAR+QUEUE");
++
++        qfilep++;
++
++        inner_loopcnt++;
++        queue_search = queue_search->next;
++        
++        ck_free(tweaked);
++        free_var_array(outbufvars, outbufvars_allocs);
++
++      } // end while searching through all queue files for concat of the current var
++
++      fprintf(aflout_extras, "[WC-AFL] End of Inner Loop queue_size= %lld, loop count = %d, inner loop cnt = %u,  est totol_execs=%d \n", queue_elem_cnt, loopcnt, inner_loopcnt, (loopcnt*inner_loopcnt) );
++
++      ck_free(qbuff);
++      free_var_array(var_str, 3);
++
++    } //end while keepgoing != 7
++    // end of loop print is above
++
++    stopped_running_queue_at = queue_top;
++    qskip++;
++
++    cur_var[POSTS] = NULL;
++    cur_var[GETS] = NULL;
++    cur_var[COOKIES] = NULL;
++
++    fprintf(logfile2,"\n");
++
++    fflush(logfile2);
++
++  // clean up vars_ll
++  int free_cnt = 0;
++  for(int i=0; i < 3;i++){
++    struct var_entry* cur_ve = vars_ll[i];
++    while (cur_ve != NULL){
++      struct var_entry* prior_ve = cur_ve;
++      cur_ve = prior_ve->next;
++      prior_ve->next = NULL;
++      free(prior_ve->varname);
++      ck_free(prior_ve);
++      entry_cnt--;
++      free_cnt++;
++    }
++    vars_ll[i] = NULL;
++  }
++  
++  fprintf(aflout_extras, "[WC-AFL] Number of entries not freed = %u and number frees performed = %d\n", entry_cnt, free_cnt);
++  
++  new_hit_cnt = queued_paths + unique_crashes;
++
++  stage_finds[STAGE_EXTRAS_HQC]  += new_hit_cnt - orig_hit_cnt;
++  fprintf(aflout_extras, "[WC-AFL] FINISHED http extras stage  Total Paths =%lld, Paths Gained=%lld, Total Paths gained from Stage =%lld\n"
++          ,new_hit_cnt, new_hit_cnt - orig_hit_cnt, stage_finds[STAGE_EXTRAS_HT]);
++
++  stage_cycles[STAGE_EXTRAS_HQC] += stage_max;
++
++/*
++   * HTTP STAGE 2
++   * Start of HTTP Extras stage 2, dictionary stage
++   * The HTTP dictionary stage takes random number of variables from the dictionary and adds them to the COOKIES/GETS/POSTS
++   * of the out_buf and tests them
++   * TODO: this might not need to be part of the non-deterministic group
++   */
++  http_dictionary_havoc_stage :
++  
++  if (aflout_extras == NULL){
++    aflout_extras  = fopen("/tmp/aflout-extras.log","a+");  // DEBUG TO REMOVE
++  }
++
++  if (sync_id){
++    fprintf(aflout_extras, "[WC-AFL] ******* Processing HTTP Stage 2 for %s ******** \n", sync_id);
++  } else {
++    fprintf(aflout_extras, "[WC-AFL] ******* Processing HTTP Stage 2 for MASTER ******** \n");
++  }
++  
++  if (skip_http_dict) goto havoc_stage;
++
++  stage_name  = "http extras (ins)";
++  stage_short = "ext_HT";
++  stage_cur   = 0;
++  stage_max   = extras_cnt * len;
++
++  stage_val_type = STAGE_VAL_NONE;
++
++  orig_hit_cnt = queued_paths + unique_crashes;
++  prior_round_hit_cnt = orig_hit_cnt;
++
++//  fprintf(aflout_extras, "[WC-AFL] Initial Input => \e[34m");
++//  simp_pbuf(len, out_buf, aflout_extras);
++//  fprintf(aflout_extras,"\e[0m\n");
++
++  for (exptr = 0; exptr < extras_cnt; exptr++) {
++    random_items = UR(10) + 1;
++    // extras is ordered by length, last element is longest
++    add_on = ck_alloc(extras[extras_cnt-1].len*random_items + 2);
++
++    add_on[0] = '&';
++    add_on_len = 1;
++
++    zeroPntCnt = 0;
++    last_optr = 0;
++    cur_pick_len = 0;
++
++    // randomly chose X items from dictionary to add
++    for (t = 0; t < random_items; t++) {
++      if (t==0){
++        random_loc = exptr;
++      } else {
++        random_loc = UR(extras_cnt);
++      }
++      memcpy(add_on + add_on_len, extras[random_loc].data, extras[random_loc].len);
++      add_on_len += extras[random_loc].len;
++    } // end for t
++    add_on[add_on_len] = '\x00';
++    add_on_len += 1;
++    //fprintf(aflout_extras, "\t Created Random list of args add_to len=%d   max=%d\n", add_on_len, extras[extras_cnt-1].len*random_items+2);
++
++    // outbuf length + an add_on for cookies, get, and post
++
++    last_zero_ptr = 0;
++    for (optr=0; optr < len; optr++){
++      if (out_buf[optr] == '\x00'){
++        zeroPntCnt++;
++        last_zero_ptr = optr;
++        if (zeroPntCnt == 3){
++          fprintf(aflout_extras, "breaking out \n");
++          break;
++        }
++      }
++    }
++
++    pick_len = len + add_on_len * 3 - zeroPntCnt;
++    pick_buf = ck_alloc(pick_len);
++
++    for (optr=0; optr <= last_zero_ptr; optr++){
++      if (out_buf[optr] == '\x00'){
++        memcpy(pick_buf+cur_pick_len, out_buf+last_optr, optr-last_optr);
++        added_dist = optr - last_optr;
++        memcpy(pick_buf+cur_pick_len+added_dist, add_on, add_on_len);
++        last_optr = optr +1;
++        cur_pick_len += added_dist + add_on_len;
++      }
++    }
++    // if less than 3 null bytes appear in input, then tack on for the remaining.
++    if (zeroPntCnt < 3 && len > 0){
++      optr = len;
++      //fprintf(aflout_extras, "[WC-AFL] %d < 3 :: Tacking on unused out_buf cur_pick_len=%d, last_opt=%d, unused_len=%d\n", zeroPntCnt, cur_pick_len, last_optr, optr-last_optr);
++      memcpy(pick_buf+cur_pick_len, out_buf+last_optr, optr-last_optr);
++
++      added_dist = optr - last_optr;
++      cur_pick_len += added_dist;
++      //fprintf(aflout_extras, "[WC-AFL] Adding add_on %d %d\n", cur_pick_len, add_on_len);
++      memcpy(pick_buf+cur_pick_len, add_on, add_on_len);
++      last_optr = optr+1;
++      zeroPntCnt++;
++
++      cur_pick_len += add_on_len;
++    }
++
++    for (x=zeroPntCnt; x < 3;x++){
++      memcpy(pick_buf+cur_pick_len, add_on, add_on_len );
++      cur_pick_len += add_on_len;
++    } //end x
++
++    fflush(aflout_extras);
++    ck_free(add_on);
++
++//    fprintf(aflout_extras, "[WC-AFL] Final Input => ");
++//    simp_pbuf(cur_pick_len, pick_buf, aflout_extras);
++//    fprintf(aflout_extras, " END TESTER VAR %d v %d maxlen=%d cur_pick_len=%d\n", add_on_len, t, pick_len, cur_pick_len);
++//
++//    fprintf(aflout_extras, "Pick_buf start=%p ender pos= %d,%d  val= %x\n", pick_buf, ALLOC_S(pick_buf), pick_len, ALLOC_C2(pick_buf));
++//    fflush(aflout_extras);
++
++    int current_hit_cnt = queued_paths + unique_crashes;
++    if (common_fuzz_stuff(argv, pick_buf, cur_pick_len)) {
++      fprintf(aflout_extras, "Aborted and now freeing\n");
++      ck_free(pick_buf);
++      goto abandon_entry;
++    }
++    if (current_hit_cnt != prior_round_hit_cnt){
++      fprintf(aflout_extras,"\e[33m DICT FOUND PATH\e[0m ");
++      //simp_pbuf( cur_pick_len, pick_buf, aflout_extras);
++      prior_round_hit_cnt=current_hit_cnt;
++      //fprintf(aflout_extras, "\n\t\tTrimming %s %d ", queue_top->fname, queue_top->len);
++      //u8 trim_res = trim_case(argv, queue_top, in_buf);
++
++      //if (trim_res == FAULT_ERROR) {
++      //  FATAL("Unable to execute target application");
++      //}
++      //fprintf(aflout_extras, "\n\tShortened TO %d \n",  queue_top->len);
++    }
++
++    http_execs++;
++
++//    fprintf(aflout_extras, "Pick_buf start=%p ender pos= %d,%d  val= %x\n", pick_buf, ALLOC_S(pick_buf), pick_len, ALLOC_C2(pick_buf));
++//    fflush(aflout_extras);
++
++    ck_free(pick_buf);
++
++  } // end exptr
++
++  new_hit_cnt = queued_paths + unique_crashes;
++
++  stage_finds[STAGE_EXTRAS_HT]  += new_hit_cnt - orig_hit_cnt;
++  stage_cycles[STAGE_EXTRAS_HT] += stage_max;
++
++  fprintf(aflout_extras, "[WC-AFL] END of HTTP dictionary fuzzing\n");
++
++  // The HTTP DICT routine tends to bloat the queue files, so we force a trim
++
++
++  /*****************************
++   * END HTTP Dictionary stuff
++   *****************************/
++
++  fclose(aflout_extras);
++  aflout_extras = NULL;
++
+   /****************
+    * RANDOM HAVOC *
+    ****************/
+@@ -7912,6 +8795,7 @@
+   if (getenv("AFL_NO_ARITH"))      no_arith         = 1;
+   if (getenv("AFL_SHUFFLE_QUEUE")) shuffle_queue    = 1;
+   if (getenv("AFL_FAST_CAL"))      fast_cal         = 1;
++  if (getenv("AFL_HTTP_DICT"))     skip_http_dict   = 0;
+ 
+   if (getenv("AFL_HANG_TMOUT")) {
+     hang_tmout = atoi(getenv("AFL_HANG_TMOUT"));
+@@ -7972,7 +8856,7 @@
+     use_argv = argv + optind;
+ 
+   perform_dry_run(use_argv);
+-
++  
+   cull_queue();
+ 
+   show_init_stats();
+@@ -8033,7 +8917,7 @@
+         sync_fuzzers(use_argv);
+ 
+     }
+-
++   
+     skipped_fuzz = fuzz_one(use_argv);
+ 
+     if (!stop_soon && sync_id && !skipped_fuzz) {
