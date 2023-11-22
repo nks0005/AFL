@@ -1342,7 +1342,7 @@ static void cull_queue(void) {
   }
 
   // --
-  /* Let's see if anything in the bitmap isn't captured in temp_v.
+  /* Let's see if anything in the bitmap isn't captured in temp_v.find_start_position
      If yes, and if it has a top_rated[] contender, let's use it. */
 
   for (i = 0; i < MAP_SIZE; i++)
@@ -2787,6 +2787,7 @@ static void perform_dry_run(char** argv) {
     if (res == crash_mode || res == FAULT_NOBITS)
       SAYF(cGRA "    len = %u, map size = %u, exec speed = %llu us\n" cRST, 
            q->len, q->bitmap_size, q->exec_us);
+
 
     switch (res) {
 
@@ -5111,7 +5112,7 @@ static u8 fuzz_one(char** argv) {
 
   subseq_tmouts = 0;
 
-   / = queue_cur->depth;
+  cur_depth = queue_cur->depth;
 
   /*******************************************
    * CALIBRATION (only if failed earlier on) *
@@ -5140,7 +5141,6 @@ static u8 fuzz_one(char** argv) {
       cur_skipped_paths++;
       goto abandon_entry;
     }
-
   }
 
   /************

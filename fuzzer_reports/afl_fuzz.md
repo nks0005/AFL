@@ -616,6 +616,9 @@ perform_dry_run(use_argv);
 
 // process top queue
 cull_queue();
+/*
+    queue 정제. 
+*/
 
 show_init_stats();
 
@@ -624,3 +627,140 @@ seek_to = find_start_position();
 write_stats_file(0, 0, 0);
 save_auto();
 ```
+
+
+
+
+
+
+
+
+
+
+# afl 뮤테이션 피드백?
+```c
+main():
+    while(1):
+        cull_queue();
+        fuzz_one(use_argv);
+        sync_fuzzers(use_argv);
+        // use_argv는 대상 바이너리가 들어가있음 use_argv = argv + optind;
+```
+
+## fuzz_one(use_argv):
+```c
+// 현재 queue 파일을 읽고, 내부 데이터를 orig_in, in_buf 객체에 저장 ( 메모리 )
+fd = open(queue_cur->fname, O_RDONLY);
+len = queue_cur->len;
+orig_in = in_buf = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+
+out_buf = ck_alloc_nozero(len);
+cur_depth = queue_cur->depth;
+
+if (queue_cur->cal_failed) // 만약 실패했다면..
+
+u8 res = trim_case(argv, queue_cur, in_buf);
+{
+    if (q->len < 5) return 0;
+
+    while(){
+        write_with_gap(in_buf, q->len, remove_pos, trim_avail);
+
+        fault = run_target(argv, exec_tmout);
+
+        cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+
+        if (cksum == q->exec_cksum)
+        // p->exec_cksum은 calibrate_case 함수에서 코드 커버리지 정보를 hash32로 저장한 값임 \
+         즉 같다는건 코드 커버리지 정보가 변동이 없다는 것.
+        {
+        /*
+            코드 커버리지가 같다 -> mutate을 해야함
+        */
+
+            u32 move_tail = q->len - remove_pos - trim_avail;
+
+            q->len -= trim_avail;
+            len_p2  = next_p2(q->len);
+
+            memmove(in_buf + remove_pos, in_buf + remove_pos + trim_avail, 
+                    move_tail);
+
+            /* Let's save a clean trace, which will be needed by
+            update_bitmap_score once we're done with the trimming stuff. */
+
+            if (!needs_write) {
+
+            needs_write = 1;
+            memcpy(clean_trace, trace_bits, MAP_SIZE);
+
+            }
+
+        } 
+
+    }
+}
+queue_cur->trim_done = 1;
+
+// == TRIM 에서는 코드 커버리지 정보의 해쉬 정보가 바뀌는지 여부로 mutate 함 ==
+
+
+
+  /*********************************************
+   * SIMPLE BITFLIP (+dictionary construction) *
+   *********************************************/
+
+  // 1/1, 8/8 에서 해쉬를 비교해서 특정 작업을 수행함 .
+
+
+orig_hit_cnt = queued_paths + unique_crashes;
+prev_cksum = queue_cur->exec_cksum;
+
+
+/*
+    FLIP_BIT(out_buf, stage_cur);
+    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+    FLIP_BIT(out_buf, stage_cur);
+
+    common_fuzz_stuff 가 1이 되려면 TIMEOUT 이거나 .. 비정상적으로 프로그램이 동작하지 않았을 경우. 
+
+    queued_discovered += save_if_interesting(argv, out_buf, len, fault);
+
+    플립을 2번 함으로써 원상 복구
+
+    Queue의 처음부터 끝까지 플립함.
+
+*/
+
+    if (!dumb_mode && (stage_cur & 7) == 7) // 0~7 할때마다[8의 배수].. hash32를 비교해서
+
+    if (stage_cur == stage_max - 1 && cksum == prev_cksum)  // 마지막까지 왔는데 변동이 없는 경우..
+    else if (cksum != prev_cksum)
+
+        maybe_add_auto(a_collect, a_len); // [TODO] 분석
+
+  /**********************
+   * ARITHMETIC INC/DEC *
+   **********************/
+
+  // 피드백 부분이 없는것으로 보임
+
+
+  /**********************
+   * INTERESTING VALUES *
+   **********************/
+
+  
+```
+
+## run_target(argv, exec_tmout):
+memset(trace_bits, 0, MAP_SIZE);
+
+
+## common_fuzz_stuff(argv, out_buf, len)
+```c
+write_to_testcase(out_buf, len);
+fault = run_target(argv, exec_tmout);
+queued_discovered += save_if_interesting(argv, out_buf, len, fault);
+```
+
