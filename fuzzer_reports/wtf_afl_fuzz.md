@@ -23,3 +23,24 @@ getValue
 postValue
 
 모든 Value 들을 mutate?
+
+seed <- queue -> id:000000
+
+seed a
+
+fuzz
+
+seed a -> queue.depth++;
+
+seed
+
+
+
+
+seed a
+
+
+<?php 
+$str = "What does \'yolo' mean?";
+echo addslashes($str); 
+?> 
